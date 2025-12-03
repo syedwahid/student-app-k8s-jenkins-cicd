@@ -1,103 +1,74 @@
 pipeline {
     agent any
     
-    environment {
-        // Docker Hub credentials (must be set up in Jenkins credentials)
-        DOCKER_USERNAME = credentials('docker-hub')
-        DOCKER_PASSWORD = credentials('docker-hub')
-    }
-    
     stages {
         stage('Checkout') {
             steps {
                 checkout scm
-                echo '✅ Source code checked out successfully'
+                echo '✅ Source code checked out'
             }
         }
         
-        stage('List Files') {
+        stage('List Project') {
             steps {
                 sh '''
                     echo "📁 Project Structure:"
                     ls -la
                     echo ""
-                    echo "📁 App Directory:"
+                    echo "📦 App Directory:"
                     ls -la app/
                 '''
-            }
-        }
-        
-        stage('Validate Dockerfiles') {
-            steps {
-                script {
-                    echo '🔍 Checking Dockerfiles...'
-                    
-                    // Check backend
-                    if (fileExists('app/backend/Dockerfile')) {
-                        echo '✅ Backend Dockerfile exists'
-                        sh 'head -5 app/backend/Dockerfile'
-                    } else {
-                        echo '❌ Backend Dockerfile missing'
-                    }
-                    
-                    // Check frontend
-                    if (fileExists('app/frontend/Dockerfile')) {
-                        echo '✅ Frontend Dockerfile exists'
-                        sh 'head -5 app/frontend/Dockerfile'
-                    } else {
-                        echo '❌ Frontend Dockerfile missing'
-                    }
-                }
             }
         }
         
         stage('Test Docker Builds') {
             steps {
                 script {
-                    echo '🏗️ Testing Docker builds...'
+                    echo '🏗️ Testing local Docker builds...'
                     
                     // Test backend build
-                    dir('app/backend') {
-                        try {
+                    if (fileExists('app/backend/Dockerfile')) {
+                        dir('app/backend') {
                             sh '''
-                                echo "Building backend..."
-                                docker build --no-cache -t student-backend-test .
-                                echo "✅ Backend build successful"
+                                echo "🔧 Building backend image locally..."
+                                docker build -t student-backend-local .
+                                echo "✅ Backend built successfully"
+                                docker images | grep student-backend
                             '''
-                        } catch (Exception e) {
-                            echo "⚠️ Backend build failed: ${e.message}"
                         }
+                    } else {
+                        echo '❌ Backend Dockerfile not found'
                     }
                     
                     // Test frontend build
-                    dir('app/frontend') {
-                        try {
+                    if (fileExists('app/frontend/Dockerfile')) {
+                        dir('app/frontend') {
                             sh '''
-                                echo "Building frontend..."
-                                docker build --no-cache -t student-frontend-test .
-                                echo "✅ Frontend build successful"
+                                echo "🎨 Building frontend image locally..."
+                                docker build -t student-frontend-local .
+                                echo "✅ Frontend built successfully"
+                                docker images | grep student-frontend
                             '''
-                        } catch (Exception e) {
-                            echo "⚠️ Frontend build failed: ${e.message}"
                         }
+                    } else {
+                        echo '❌ Frontend Dockerfile not found'
                     }
                 }
             }
         }
         
-        stage('Test Docker Login') {
+        stage('Test Kubernetes Files') {
             steps {
                 script {
-                    echo '🔐 Testing Docker Hub credentials...'
+                    echo '📋 Checking Kubernetes manifests...'
                     
-                    try {
-                        sh '''
-                            echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin
-                            echo "✅ Docker Hub login successful"
-                        '''
-                    } catch (Exception e) {
-                        echo "❌ Docker Hub login failed"
-                        echo "Make sure docker-hub credentials are set up in Jenkins"
+                    if (fileExists('k8s/namespace.yaml')) {
+                        echo '✅ namespace.yaml exists'
+                    }
+                    
+                    if (fileExists('k8s/backend/deployment.yaml')) {
+                        echo '✅ backend/deployment.yaml exists'
+                        sh 'head -10 k8s/backend/deployment.yaml'
                     }
                 }
             }
@@ -108,31 +79,19 @@ pipeline {
         success {
             echo '🎉 Pipeline completed successfully!'
             script {
-                currentBuild.description = "✅ Build #${BUILD_NUMBER} - Success"
+                currentBuild.description = "✅ Success - Build #${BUILD_NUMBER}"
             }
         }
         failure {
             echo '❌ Pipeline failed!'
             script {
-                currentBuild.description = "❌ Build #${BUILD_NUMBER} - Failed"
+                currentBuild.description = "❌ Failed - Build #${BUILD_NUMBER}"
             }
         }
         always {
-            script {
-                // Run inside node block
-                node {
-                    echo "📊 Build Summary:"
-                    echo "Build Number: ${BUILD_NUMBER}"
-                    echo "Duration: ${currentBuild.durationString}"
-                    echo "Result: ${currentBuild.currentResult}"
-                    
-                    // Clean up test images
-                    sh '''
-                        echo "🧹 Cleaning up..."
-                        docker rmi student-backend-test student-frontend-test 2>/dev/null || true
-                    '''
-                }
-            }
+            echo "📊 Build #${BUILD_NUMBER} completed"
+            echo "Result: ${currentBuild.currentResult}"
+            echo "Duration: ${currentBuild.durationString}"
         }
     }
 }
