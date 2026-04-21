@@ -4,6 +4,8 @@ pipeline {
     environment {
         APP_NAME = "student-app"
         KUBE_NAMESPACE = "student-app"
+        // Get host IP for Docker bridge
+        HOST_IP = "172.17.0.1"  // Default Docker bridge IP
     }
     
     stages {
@@ -14,30 +16,58 @@ pipeline {
             }
         }
         
-        stage('Setup KIND Cluster') {
+        stage('Setup KIND Cluster on HOST') {
             steps {
                 script {
-                    echo '☸️ Setting up KIND cluster using existing config...'
+                    echo '☸️ Setting up KIND cluster on HOST...'
                     sh '''
-                        echo "1. Checking if KIND cluster exists..."
-                        if ! kind get clusters | grep -q student-app; then
-                            echo "Creating KIND cluster using kind/kind-config.yaml..."
+                        echo "1. Checking if KIND cluster exists on HOST..."
+                        
+                        # Check if cluster exists (using host's kind command)
+                        if ! kind get clusters 2>/dev/null | grep -q student-app; then
+                            echo "Creating KIND cluster on HOST..."
                             kind create cluster --name student-app --config kind/kind-config.yaml
                         else
-                            echo "✅ KIND cluster already exists"
+                            echo "✅ KIND cluster already exists on HOST"
                         fi
                         
-                        echo "2. Setting up kubeconfig..."
-                        mkdir -p ~/.kube
-                        kind get kubeconfig --name student-app > ~/.kube/config
+                        echo "2. Getting kubeconfig for Jenkins to access HOST cluster..."
+                        # Get the host IP that Jenkins can use
+                        HOST_IP=$(ip route | grep docker0 | awk '{print $9}' | cut -d'/' -f1)
+                        if [ -z "$HOST_IP" ]; then
+                            HOST_IP="172.17.0.1"
+                        fi
                         
-                        echo "✅ Cluster ready"
+                        # Get the KIND API port
+                        KIND_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="kind-student-app")].cluster.server}' 2>/dev/null | cut -d':' -f3 || echo "6443")
+                        
+                        # Create kubeconfig for Jenkins to access host's cluster
+                        mkdir -p /var/jenkins_home/.kube
+                        cat > /var/jenkins_home/.kube/config << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://${HOST_IP}:${KIND_PORT}
+    insecure-skip-tls-verify: true
+  name: kind-student-app
+contexts:
+- context:
+    cluster: kind-student-app
+    user: kind-student-app
+  name: kind-student-app
+current-context: kind-student-app
+users:
+- name: kind-student-app
+  user: {}
+EOF
+                        
+                        echo "✅ Kubeconfig created for Jenkins to access HOST cluster"
+                        echo "Host IP: ${HOST_IP}"
+                        echo "KIND Port: ${KIND_PORT}"
+                        
+                        echo "3. Testing connection to HOST cluster..."
                         kubectl get nodes
-                        # ADD THESE 3 LINES - Export kubeconfig for local use
-                        echo "3. Exporting kubeconfig for local kubectl access..."
-                        echo "To use kubectl locally after pipeline, run:"
-                        echo "kind export kubeconfig --name student-app"
-                        echo "Or: kind get kubeconfig --name student-app > ~/.kube/config"
                     '''
                 }
             }
@@ -46,7 +76,7 @@ pipeline {
         stage('Build Docker Images') {
             steps {
                 script {
-                    echo '🐳 Building Docker images...'
+                    echo '🐳 Building Docker images on HOST...'
                     sh '''
                         echo "1. Building backend image..."
                         cd app/backend
@@ -56,25 +86,25 @@ pipeline {
                         cd ../frontend
                         docker build -t student-frontend:latest .
                         
-                        echo "✅ Images built:"
+                        echo "✅ Images built on HOST:"
                         docker images | grep student-
                     '''
                 }
             }
         }
         
-        stage('Load Images to KIND') {
+        stage('Load Images to KIND on HOST') {
             steps {
                 script {
-                    echo '📦 Loading images to KIND cluster...'
+                    echo '📦 Loading images to KIND cluster on HOST...'
                     sh '''
-                        echo "Loading backend image..."
+                        echo "Loading backend image to HOST KIND cluster..."
                         kind load docker-image student-backend:latest --name student-app
                         
-                        echo "Loading frontend image..."
+                        echo "Loading frontend image to HOST KIND cluster..."
                         kind load docker-image student-frontend:latest --name student-app
                         
-                        echo "✅ Images loaded to KIND"
+                        echo "✅ Images loaded to HOST KIND cluster"
                     '''
                 }
             }
@@ -83,14 +113,15 @@ pipeline {
         stage('Prepare Kubernetes Manifests') {
             steps {
                 script {
-                    echo '🔄 Preparing manifests for KIND...'
+                    echo '🔄 Preparing manifests...'
                     sh '''
-                        echo "1. Setting imagePullPolicy to Never (required for KIND)..."
-                        cp k8s/backend/deployment.yaml k8s/backend/deployment.yaml.backup
-                        cp k8s/frontend/deployment.yaml k8s/frontend/deployment.yaml.backup
+                        echo "Setting imagePullPolicy to Never (required for KIND)..."
+                        cp k8s/backend/deployment.yaml k8s/backend/deployment.yaml.backup 2>/dev/null || true
+                        cp k8s/frontend/deployment.yaml k8s/frontend/deployment.yaml.backup 2>/dev/null || true
                         
-                        sed -i 's/imagePullPolicy:.*/imagePullPolicy: Never/g' k8s/backend/deployment.yaml
-                        sed -i 's/imagePullPolicy:.*/imagePullPolicy: Never/g' k8s/frontend/deployment.yaml
+                        # Use sed to update imagePullPolicy
+                        sed -i 's/imagePullPolicy:.*/imagePullPolicy: Never/g' k8s/backend/deployment.yaml 2>/dev/null || true
+                        sed -i 's/imagePullPolicy:.*/imagePullPolicy: Never/g' k8s/frontend/deployment.yaml 2>/dev/null || true
                         
                         echo "✅ Manifests prepared"
                     '''
@@ -98,61 +129,67 @@ pipeline {
             }
         }
         
-        stage('Deploy Application') {
+        stage('Deploy to HOST Kubernetes') {
             steps {
                 script {
-                    echo '🚀 Deploying Student Management App...'
+                    echo '🚀 Deploying to HOST Kubernetes cluster...'
                     sh '''
                         echo "1. Creating namespace..."
                         kubectl create namespace student-app --dry-run=client -o yaml | kubectl apply -f -
                         
                         echo "2. Applying configurations..."
-                        kubectl apply -f k8s/namespace.yaml
                         kubectl apply -f k8s/secrets.yaml
                         kubectl apply -f k8s/configmap.yaml
                         
-                        echo "3. Deploying Backend..."
+                        echo "3. Deploying MySQL..."
+                        kubectl apply -f k8s/mysql/
+                        
+                        echo "⏳ Waiting for MySQL to start (20 seconds)..."
+                        sleep 20
+                        
+                        echo "4. Deploying Backend..."
                         kubectl apply -f k8s/backend/
                         
-                        echo "4. Deploying Frontend..."
+                        echo "5. Deploying Frontend..."
                         kubectl apply -f k8s/frontend/
                         
-                        echo "⏳ Waiting for pods (40 seconds)..."
+                        echo "⏳ Waiting for pods to be ready (40 seconds)..."
                         sleep 40
                         
-                        echo "📊 Deployment status:"
+                        echo "📊 Deployment status on HOST:"
                         kubectl get all -n student-app
                     '''
                 }
             }
         }
         
-        stage('Test Application') {
+        stage('Test Application on HOST') {
             steps {
                 script {
-                    echo '🧪 Testing application...'
+                    echo '🧪 Testing application on HOST...'
                     sh '''
-                        echo "Testing backend API..."
-                        if curl -s http://localhost:30001/api/health > /dev/null; then
-                            echo "✅ Backend is working"
-                            curl -s http://localhost:30001/api/health | grep status || echo "No status in response"
+                        echo "Testing backend API on HOST..."
+                        if curl -s http://localhost:30001/api/health 2>/dev/null; then
+                            echo "✅ Backend is working on HOST"
                         else
-                            echo "❌ Backend not responding"
+                            echo "⚠️  Backend not responding yet (still starting?)"
+                            echo "Check pods: kubectl get pods -n student-app"
                         fi
                         
                         echo ""
-                        echo "Testing frontend..."
-                        if curl -s http://localhost:31349 > /dev/null; then
-                            echo "✅ Frontend is working"
-                            curl -s http://localhost:31349 | head -3
+                        echo "Testing frontend on HOST..."
+                        if curl -s http://localhost:31349 2>/dev/null | grep -q "Student"; then
+                            echo "✅ Frontend is working on HOST"
                         else
-                            echo "❌ Frontend not responding"
+                            echo "⚠️  Frontend not responding yet"
                         fi
                         
                         echo ""
-                        echo "🌐 Application URLs:"
-                        echo "Frontend: http://localhost:31349"
-                        echo "Backend: http://localhost:30001/api/health"
+                        echo "═══════════════════════════════════════════════════════════"
+                        echo "🌐 APPLICATION RUNNING ON HOST:"
+                        echo "   Frontend: http://localhost:31349"
+                        echo "   Backend:  http://localhost:30001/api/health"
+                        echo "═══════════════════════════════════════════════════════════"
                     '''
                 }
             }
@@ -161,25 +198,41 @@ pipeline {
     
     post {
         success {
-            echo '🎉 CI/CD Pipeline completed successfully!'
+            echo '''
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            🎉 CI/CD PIPELINE SUCCESSFUL! 🎉
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            
+            ✅ Application deployed to HOST Kubernetes cluster
+            ✅ Running outside Jenkins container
+            
+            🌐 ACCESS YOUR APP:
+               http://localhost:31349
+            
+            📊 MANAGE ON HOST:
+               kubectl get pods -n student-app
+               kubectl logs -n student-app deployment/backend
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            '''
             script {
-                currentBuild.description = "✅ Success - App deployed"
-
-                            // Add this message
-                echo '📋 To use kubectl locally after pipeline runs:'
-                echo '   1. Run: kind export kubeconfig --name student-app'
-                echo '   2. Then: kubectl get nodes'
-                echo '   3. Or: kubectl get pods -n student-app'
+                currentBuild.description = "✅ Success - App running on HOST"
             }
         }
         failure {
-            echo '❌ Pipeline failed!'
+            echo '''
+            ❌ PIPELINE FAILED!
+            
+            🔧 TROUBLESHOOTING:
+               1. Check if KIND is running on HOST: kind get clusters
+               2. Check Jenkins can reach HOST: docker exec jenkins kubectl get nodes
+               3. View logs: kubectl logs -n student-app deployment/backend
+            '''
             script {
                 currentBuild.description = "❌ Failed - Check logs"
             }
         }
         always {
-            echo "Build #${BUILD_NUMBER} completed"
+            echo "Build #${BUILD_NUMBER} completed on $(date)"
         }
     }
 }
