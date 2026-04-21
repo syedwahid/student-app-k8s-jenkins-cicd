@@ -4,7 +4,6 @@ pipeline {
     environment {
         APP_NAME = "student-app"
         KUBE_NAMESPACE = "student-app"
-        // Get host IP for Docker bridge
         HOST_IP = "172.17.0.1"  // Default Docker bridge IP
     }
     
@@ -31,7 +30,7 @@ pipeline {
                             echo "✅ KIND cluster already exists on HOST"
                         fi
                         
-                        echo "2. Getting kubeconfig for Jenkins to access HOST cluster..."
+                        echo "2. Setting up kubeconfig for Jenkins to access HOST cluster..."
                         # Get the host IP that Jenkins can use
                         HOST_IP=$(ip route | grep docker0 | awk '{print $9}' | cut -d'/' -f1)
                         if [ -z "$HOST_IP" ]; then
@@ -39,7 +38,10 @@ pipeline {
                         fi
                         
                         # Get the KIND API port
-                        KIND_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="kind-student-app")].cluster.server}' 2>/dev/null | cut -d':' -f3 || echo "6443")
+                        KIND_PORT=$(docker inspect student-app-control-plane 2>/dev/null | grep -A 5 "PortBindings" | grep "HostPort" | head -1 | awk -F'"' '{print $4}')
+                        if [ -z "$KIND_PORT" ]; then
+                            KIND_PORT="6443"
+                        fi
                         
                         # Create kubeconfig for Jenkins to access host's cluster
                         mkdir -p /var/jenkins_home/.kube
@@ -171,6 +173,7 @@ EOF
                         echo "Testing backend API on HOST..."
                         if curl -s http://localhost:30001/api/health 2>/dev/null; then
                             echo "✅ Backend is working on HOST"
+                            curl -s http://localhost:30001/api/health
                         else
                             echo "⚠️  Backend not responding yet (still starting?)"
                             echo "Check pods: kubectl get pods -n student-app"
@@ -198,41 +201,53 @@ EOF
     
     post {
         success {
-            echo '''
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            🎉 CI/CD PIPELINE SUCCESSFUL! 🎉
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            
-            ✅ Application deployed to HOST Kubernetes cluster
-            ✅ Running outside Jenkins container
-            
-            🌐 ACCESS YOUR APP:
-               http://localhost:31349
-            
-            📊 MANAGE ON HOST:
-               kubectl get pods -n student-app
-               kubectl logs -n student-app deployment/backend
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            '''
             script {
+                sh '''
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "🎉 CI/CD PIPELINE SUCCESSFUL! 🎉"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo ""
+                    echo "✅ Application deployed to HOST Kubernetes cluster"
+                    echo "✅ Running outside Jenkins container"
+                    echo ""
+                    echo "🌐 ACCESS YOUR APP:"
+                    echo "   http://localhost:31349"
+                    echo ""
+                    echo "📊 MANAGE ON HOST:"
+                    echo "   kubectl get pods -n student-app"
+                    echo "   kubectl logs -n student-app deployment/backend"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                '''
                 currentBuild.description = "✅ Success - App running on HOST"
+                
+                // Fixed line - removed $(date) syntax error
+                def buildDate = new Date().toString()
+                echo "Build #${BUILD_NUMBER} completed on ${buildDate}"
             }
         }
+        
         failure {
-            echo '''
-            ❌ PIPELINE FAILED!
-            
-            🔧 TROUBLESHOOTING:
-               1. Check if KIND is running on HOST: kind get clusters
-               2. Check Jenkins can reach HOST: docker exec jenkins kubectl get nodes
-               3. View logs: kubectl logs -n student-app deployment/backend
-            '''
             script {
+                sh '''
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "❌ PIPELINE FAILED!"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo ""
+                    echo "🔧 TROUBLESHOOTING:"
+                    echo "   1. Check if KIND is running on HOST: kind get clusters"
+                    echo "   2. Check Jenkins can reach HOST: docker exec jenkins kubectl get nodes"
+                    echo "   3. View logs: kubectl logs -n student-app deployment/backend"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                '''
                 currentBuild.description = "❌ Failed - Check logs"
             }
         }
+        
         always {
-            echo "Build #${BUILD_NUMBER} completed on $(date)"
+            script {
+                def endDate = new Date().toString()
+                echo "Pipeline execution completed on ${endDate}"
+            }
         }
     }
 }
